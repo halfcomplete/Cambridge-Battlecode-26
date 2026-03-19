@@ -4,7 +4,14 @@ from constants import DIRECTIONS
 # Ignore the import error for cambc since it's only available in the battlecode environment
 from cambc import Controller, Direction, EntityType, Environment, Position # type: ignore
 
-def execute_behaviour(ct: Controller) -> None:
+class BuilderBotState:
+    """
+    Class to represent the state of a builder bot entity, which can be used to make decisions in its behaviour logic.
+    """
+    def __init__(self):
+        self.num_spawned = 0
+
+def execute_behaviour(ct: Controller, state: BuilderBotState) -> None:
     """
     This function is the main entry point for main.py to run the builder bot's behaviour logic.
     """
