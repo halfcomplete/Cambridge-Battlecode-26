@@ -66,7 +66,8 @@ class Player:
         move_pos = ct.get_position().add(move_dir)
         # we need to place a conveyor or road to stand on, before we can move onto a tile
         if ct.can_build_road(move_pos):
-            ct.build_road(move_pos)
+            ct.build_conveyor(move_pos)
+            
         if ct.can_move(move_dir):
             ct.move(move_dir)
 
@@ -74,7 +75,8 @@ class Player:
         marker_pos = ct.get_position().add(random.choice(DIRECTIONS))
         if ct.can_place_marker(marker_pos):
             ct.place_marker(marker_pos, ct.get_current_round())
-    
+
+        
     def determine_tile_to_move_to() -> Position:
         ...
 
