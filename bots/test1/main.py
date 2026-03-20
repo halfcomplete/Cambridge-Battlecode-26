@@ -3,7 +3,7 @@
 import random
 from collections import deque
 
-from cambc import Controller, Direction, EntityType, Position
+from cambc import Controller, Direction, EntityType, Position, Environment
 
 # IMPORTANT: manually define directions (engine is not iterable)
 DIRECTIONS = [
@@ -137,8 +137,8 @@ class Player:
             current = queue.popleft()
 
             # found ore
-            if hasattr(ct, "is_ore") and ct.is_ore(current):
-                return self.reconstruct_path(parent, start, current)
+            # if ct.get_tile_env(current) in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+            #     return self.reconstruct_path(parent, start, current)
 
             if abs(current.x - start.x) + abs(current.y - start.y) > max_radius:
                 continue
@@ -160,16 +160,16 @@ class Player:
 
         return None
 
-    def reconstruct_path(self, parent, start, end):
-        path = []
-        curr = (end.x, end.y)
+    # def reconstruct_path(self, parent, start, end):
+    #     path = []
+    #     curr = (end.x, end.y)
 
-        while curr != (start.x, start.y):
-            path.append(Position(curr[0], curr[1]))
-            curr = parent[curr]
+    #     while curr != (start.x, start.y):
+    #         path.append(Position(curr[0], curr[1]))
+    #         curr = parent[curr]
 
-        path.reverse()
-        return path
+    #     path.reverse()
+    #     return path
 
     # ================= HELPERS =================
     def get_direction_to(self, start: Position, nxt: Position):
