@@ -30,3 +30,13 @@ def get_all_tile_positions_in_range(r: float, p: Position) -> list:
     """
     deltas = get_all_deltas_in_range(r)
     return [Position(p.x + dx, p.y + dy) for dx, dy in deltas]
+
+
+def is_position_in_bounds(ct: Controller, pos: Position) -> bool:
+    """
+    Returns whether the given position is within the bounds of the map.
+    """
+    return 0 <= pos.x < ct.get_map_width() and 0 <= pos.y < ct.get_map_height()
+
+def chebyshev_distance(a: Position, b: Position) -> int:
+    return max(abs(a.x - b.x), abs(a.y - b.y))
