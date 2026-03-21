@@ -14,7 +14,7 @@ This bot:
 import random
 import math
 
-import core, builder_bot, gunner, sentinel, breach, launcher
+from entity_specific import core, builder_bot, gunner, sentinel, breach, launcher
 
 # Ignore the import error for cambc since it's only available in the battlecode environment
 from cambc import Controller, Direction, EntityType, Environment, Position # type: ignore
