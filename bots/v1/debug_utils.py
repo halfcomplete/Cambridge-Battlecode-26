@@ -12,8 +12,8 @@ class DebugMessageType(Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
 
-def print_debug_msg(msg: str, msg_type: DebugMessageType = DebugMessageType.INFO) -> None:
+def print_debug_msg(ct: Controller, msg: str, msg_type: DebugMessageType = DebugMessageType.INFO) -> None:
     """
     Utility function to print debug messages in a consistent format.
     """
-    print(f"[{msg_type.value}] {msg} (Round {Controller.get_round_number()})")
+    print(f"[{msg_type.value}] {msg} (Round {ct.get_current_round()})")
