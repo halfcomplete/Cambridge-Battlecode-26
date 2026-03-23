@@ -1,47 +1,35 @@
-from cambc import Controller, Direction, Position, Environment, EntityType
+"""Ultra-fast Battlecode bot (NO BFS, pure greedy exploration)"""
+
+import random
+
+from cambc import Controller, Direction, EntityType, Position, Environment
 
 DIRECTIONS = [
     Direction.NORTH,
-    Direction.NORTHEAST,
-    Direction.EAST,
-    Direction.SOUTHEAST,
     Direction.SOUTH,
-    Direction.SOUTHWEST,
+    Direction.EAST,
     Direction.WEST,
-    Direction.NORTHWEST,
 ]
+
 
 class Player:
     def __init__(self) -> None:
         self.num_spawned = 0
         self.core_pos = None
-
-        # path system
-        self.current_path = []
-        self.path_index = 0
-        self.returning = False
-
-        # per-bot memory
-        self.last_pos = None
+        self.last_harvested = None
 
     def run(self, ct: Controller) -> None:
-        self.delegate_behaviour(ct)
-
-    def delegate_behaviour(self, ct: Controller) -> None:
-        etype = ct.get_entity_type()
-
-        if etype == EntityType.CORE:
-            self.execute_core_behaviour(ct)
-        elif etype == EntityType.BUILDER_BOT:
-            self.execute_builder_bot_behaviour(ct)
+        if ct.get_entity_type() == EntityType.CORE:
+            self.core_behaviour(ct)
+        else:
+            self.builder_behaviour(ct)
 
     # ================= CORE =================
-    def execute_core_behaviour(self, ct: Controller) -> None:
+    def core_behaviour(self, ct: Controller) -> None:
         self.core_pos = ct.get_position()
 
-        if self.num_spawned < 3:
-            pos = ct.get_position()
-
+        if self.num_spawned < 7:
+            pos = self.core_pos
             for dx in range(-1, 2):
                 for dy in range(-1, 2):
                     target = Position(pos.x + dx, pos.y + dy)
@@ -50,28 +38,67 @@ class Player:
                         self.num_spawned += 1
                         return
 
-    # ================= BUILDER BOT =================
-    def execute_builder_bot_behaviour(self, ct: Controller) -> None:
-        self.ctrl = ct
-        moved = False
-        while moved == False:
-            current_position = ct.get_position()
-            current_direction = ct.get_direction()
-            current_move = current_position+current_direction
+    # ================= BUILDER =================
+    def builder_behaviour(self, ct: Controller) -> None:
+        my_pos = ct.get_position()
 
+        # ===== BUILD HARVESTER IF NEXT TO ORE =====
+        for d in DIRECTIONS:
+            adj = my_pos.add(d)
+            if ct.can_build_harvester(adj):
+                ct.build_harvester(adj)
+                self.last_harvested = adj  # remember it
 
-    # ================= UTILITIES =================
-    def find_nearest_ore(self, pos: Position) -> Position | None:
-        """Return nearest ore tile within vision radius."""
-        radius_sq = self.ctrl.get_vision_radius_sq()
-        tiles = self.ctrl.get_nearby_tiles(radius_sq)
-        closest = None
-        min_dist = float('inf')
-        for t in tiles:
-            env = self.ctrl.get_tile_env(t)
-            if env in [Environment.ORE_TITANIUM, Environment.ORE_AXIONITE]:
-                dist = pos.distance_squared(t)
+                # immediately try to move away
+                away_dir = d.opposite()
+                if ct.get_move_cooldown() == 0 and ct.can_move(away_dir):
+                    ct.move(away_dir)
+
+                return
+        # ===== LOOK FOR ORE IN VISION =====
+        target_ore = None
+        min_dist = 999999
+
+        for tile in ct.get_nearby_tiles():
+            env = ct.get_tile_env(tile)
+            if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+                if tile == self.last_harvested:
+                    continue
+                dist = my_pos.distance_squared(tile)
                 if dist < min_dist:
                     min_dist = dist
-                    closest = t
-        return closest
+                    target_ore = tile
+
+        # ===== MOVE TOWARD ORE =====
+        if target_ore:
+            move_dir = my_pos.direction_to(target_ore)
+        else:
+            # ===== EXPLORE AWAY FROM CORE =====
+            if self.core_pos:
+                move_dir = self.core_pos.direction_to(my_pos)
+            else:
+                move_dir = random.choice(DIRECTIONS)
+
+            # add randomness so bots spread
+            if random.random() < 0.3:
+                move_dir = random.choice(DIRECTIONS)
+
+        # ===== MOVEMENT + CONVEYOR BUILD =====
+        next_pos = my_pos.add(move_dir)
+        back_dir = move_dir.opposite()
+
+        # build conveyor if needed
+        if not ct.is_tile_passable(next_pos):
+            if ct.can_build_conveyor(next_pos, back_dir):
+                ct.build_conveyor(next_pos, back_dir)
+                return
+
+        # move
+        if ct.get_move_cooldown() == 0 and ct.can_move(move_dir):
+            ct.move(move_dir)
+        else:
+            # fallback: try any direction
+            for d in DIRECTIONS:
+                if ct.can_move(d):
+                    ct.move(d)
+                    break
