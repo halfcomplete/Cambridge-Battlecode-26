@@ -21,9 +21,23 @@ class Gunner():
     return
 
   def run(self, ct: Controller):
-    target = ct.get_gunner_target()
-    if target != None:
-      ct.fire(target)
+    nearbyBuildings = ct.get_nearby_buildings()
+    random.shuffle(nearbyBuildings)
+    for building in nearbyBuildings:
+      if ct.get_team() == ct.get_team(building):
+        continue
+      if ct.get_entity_type(building) == EntityType.HARVESTER:
+        continue
+      buildingPos = ct.get_position(building)
+      if not ct.can_fire(buildingPos):
+        continue
+      entityType = ct.get_entity_type(building)
+      if entityType == EntityType.CORE:
+        ct.fire(buildingPos)
+        break
+      continue
+    return
+    
 class Sentinel():
   def startup(self, ct):
     #nothin
