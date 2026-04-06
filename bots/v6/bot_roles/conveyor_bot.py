@@ -151,6 +151,8 @@ class ConveyorBot(BuilderBase):
       xAve += potPos.x
       yAve += potPos.y
       i+=1
+    if len(self.possibleEnemyCorePositions) == 0:
+      return False
     xAve /= i
     yAve /= i
     aimingPos = Position(xAve,yAve)
