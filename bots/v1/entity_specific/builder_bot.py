@@ -1,919 +1,134 @@
 import heapq
-from constants import (
-    DIRECTIONS,
-    EMPTY_TILE_COST,
-    EXPLORATION_BACKTRACK_PENALTY,
-    EXPLORATION_MEMORY_WINDOW,
-    EXPLORATION_RECENT_TILE_PENALTY,
-    IMPASSABLE_TILE_COST,
-    MARKER_KIND_CORE_SPAWN_LANE,
-    MARKER_KIND_SHIFT,
-    MARKER_KIND_VISIT,
-    MARKER_PAYLOAD_MASK,
-    MAX_TEMP_BLOCKED_TURNS,
-    MODE_EXPLORING,
-    MODE_IDLE,
-    MODE_MOVING_TO_ORE,
-    MODE_RETURNING_TO_CORE,
-    PASSABLE_TILE_COST,
-    PATHFIND_NODE_BUDGET,
-    VISIT_MARKER_FRESH_ROUNDS,
-    VISIT_MARKER_MAX_PENALTY,
-)
+import random
 
+from constants import DIRECTIONS
 import logic_utils
 from debug_utils import print_debug_msg
 
-# Ignore the import error for cambc since it's only available in the battlecode environment
 from cambc import Controller, Direction, EntityType, Environment, Position  # type: ignore
 
 
 class BuilderBotState:
-    """
-    State for a builder bot.
-
-    Important fields:
-    - mode: high-level FSM mode.
-    - target_ore: ore tile currently locked in MOVING_TO_ORE.
-    - return_goal_tile: core-adjacent tile chosen for return routing.
-    - current_path: queued list of movement directions.
-    - return_path: queued cardinal directions used while returning to core.
-    - blocked_turns: retry counter for temporary blockage.
-    - known_map: maps (x, y) -> (Environment, last_seen_round).
-    - recent_positions: short local memory used to break small exploration loops.
-    - spiral_*: fields for square-spiral exploration that expands over time.
-    - explore_fail_streak: consecutive exploration turns with no successful movement.
-    """
-
     def __init__(self):
-        self.num_spawned = 0
-
-        self.mode = MODE_IDLE
-        self.target_ore: Position | None = None
-        self.target_adjacent_tile: Position | None = None
-        self.return_goal_tile: Position | None = None
-        self.current_path: list[Direction] = []
-        self.return_path: list[Direction] = []
-        self.blocked_turns = 0
-
-        self.known_map: dict[tuple[int, int], tuple[Environment, int]] = {}
-        self.recent_positions: list[tuple[int, int]] = []
-
         self.core_position = Position(-1, -1)
+        self.known_map = {}
 
-        # Spiral exploration state.
-        self.spiral_initialized = False
-        self.spiral_heading_idx = 0
-        self.spiral_leg_length = 1
-        self.spiral_steps_on_leg = 0
-        self.spiral_legs_completed = 0
 
-        # Exploration loop recovery state.
-        self.explore_fail_streak = 0
-
+# ================= MAIN =================
 
 def execute_behaviour(ct: Controller, state: BuilderBotState) -> None:
-    """
-    Main per-turn behaviour entry point.
-
-    We write one visit marker each turn (when legal), update map memory, then:
-    - continue MOVING_TO_ORE if locked, otherwise
-    - acquire a visible ore target if possible, otherwise
-    - explore.
-    """
     my_pos = ct.get_position()
-    _record_recent_position(state, my_pos)
-    _try_place_visit_marker(ct)
 
     _update_known_map(ct, state)
 
     if state.core_position == Position(-1, -1):
         _try_cache_core_position(ct, state)
 
-    if state.mode == MODE_MOVING_TO_ORE:
-        _run_moving_to_ore(ct, state)
-        return
+    # ===== FIND ORE =====
+    visible_ore = _get_visible_ore_tiles(ct)
 
-    if state.mode == MODE_RETURNING_TO_CORE:
-        _run_returning_to_core(ct, state)
-        return
+    target_tile = None
 
-    visible_ore = _get_visible_and_available_ore_tiles(ct)
-    if visible_ore and _start_moving_to_ore(ct, state, visible_ore):
-        _run_moving_to_ore(ct, state)
-        return
+    if visible_ore:
+        ore = min(visible_ore, key=lambda p: my_pos.distance_squared(p))
 
-    state.mode = MODE_EXPLORING
-    _run_exploring(ct, state)
-
-
-def _run_moving_to_ore(ct: Controller, state: BuilderBotState) -> None:
-    """
-    Executes one turn of MOVING_TO_ORE behaviour.
-    """
-    if state.target_ore is None or state.target_adjacent_tile is None:
-        _enter_exploring(state)
-        return
-
-    if not _is_target_ore_valid(ct, state.target_ore):
-        _enter_exploring(state)
-        return
-
-    my_pos = ct.get_position()
-    if my_pos == state.target_adjacent_tile:
-        if ct.can_build_harvester(state.target_ore):
-            ct.build_harvester(state.target_ore)
-            _reset_after_harvester_build(state)
+        # build immediately if possible
+        if ct.can_build_harvester(ore):
+            ct.build_harvester(ore)
             return
 
-        if not _is_target_ore_valid(ct, state.target_ore):
-            _enter_exploring(state)
+        # move to adjacent tile instead
+        target_tile = _get_adjacent_build_tile(ct, ore)
+
+    # ===== EXPLORE =====
+    if target_tile is None:
+        target_tile = _pick_explore_target(ct, state, my_pos)
+
+    if target_tile is None:
         return
 
-    if not state.current_path:
-        if _replan_to_current_target(ct, state, my_pos):
-            state.blocked_turns = 0
-        else:
-            state.blocked_turns += 1
-            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
-                _enter_exploring(state)
+    # ===== PATHFIND =====
+    move_dir = _a_star_next_direction(ct, my_pos, target_tile)
+
+    if move_dir is None:
         return
 
-    next_direction = state.current_path[0]
-    _draw_intended_move(ct, next_direction, 255, 170, 0)
-    _draw_target_line(ct, state.target_ore, 255, 80, 80)
-    move_outcome = _try_move_with_infrastructure(ct, next_direction, build_strategy="road")
-    print_debug_msg(
-        ct,
-        f"Trying to move {next_direction} towards ore at {state.target_ore}, outcome: {move_outcome}, blocked_turns: {state.blocked_turns}",
-    )
+    next_pos = my_pos.add(move_dir)
+    back_dir = next_pos.direction_to(my_pos)
 
-    if move_outcome == "moved":
-        state.current_path.pop(0)
-        state.blocked_turns = 0
-        return
-
-    if move_outcome == "detour_moved":
-        my_pos = ct.get_position()
-        if _replan_to_current_target(ct, state, my_pos):
-            state.blocked_turns = 0
-        else:
-            state.blocked_turns += 1
-            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
-                _enter_exploring(state)
-        return
-
-    if move_outcome == "cooldown":
-        return
-
-    if move_outcome == "temporary_block":
-        if _replan_to_current_target(ct, state, my_pos):
-            state.blocked_turns = 0
-        else:
-            state.blocked_turns += 1
-            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
-                _enter_exploring(state)
-        return
-
-    _enter_exploring(state)
-
-
-def _run_returning_to_core(ct: Controller, state: BuilderBotState) -> None:
-    """
-    Return to allied core while replacing road tiles on the chosen route with
-    conveyors that point toward the core.
-    """
-    if state.core_position == Position(-1, -1):
-        _enter_exploring(state)
-        return
-
-    my_pos = ct.get_position()
-    if state.return_goal_tile is not None and my_pos == state.return_goal_tile:
-        _reset_after_return_complete(state)
-        return
-
-    if not state.return_path:
-        if not _plan_return_path_to_core(ct, state, my_pos):
-            state.blocked_turns += 1
-            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
-                _enter_exploring(state)
-            return
-        state.blocked_turns = 0
-
-    if not state.return_path:
-        _reset_after_return_complete(state)
-        return
-
-    next_direction = state.return_path[0]
-    conveyor_direction = _get_return_conveyor_direction(ct, state)
-    _draw_intended_move(ct, next_direction, 255, 230, 90)
-    move_outcome = _try_move_with_infrastructure(
-        ct,
-        next_direction,
-        build_strategy="conveyor",
-        conveyor_direction=conveyor_direction,
-        replace_road_only=True,
-    )
-
-    if move_outcome == "moved":
-        state.return_path.pop(0)
-        state.blocked_turns = 0
-        return
-
-    if move_outcome == "detour_moved":
-        if _plan_return_path_to_core(ct, state, ct.get_position()):
-            state.blocked_turns = 0
-        else:
-            state.blocked_turns += 1
-            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
-                _enter_exploring(state)
-        return
-
-    if move_outcome == "cooldown":
-        return
-
-    if _plan_return_path_to_core(ct, state, ct.get_position()):
-        state.blocked_turns = 0
-    else:
-        state.blocked_turns += 1
-        if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
-            _enter_exploring(state)
-
-
-def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
-    """
-    Exploration uses a core-anchored outward square-spiral as primary behaviour.
-    If enemy infrastructure is seen, we try to follow along it to continue expansion.
-    Fallback local scoring is kept as a safety net for blocked terrain pockets.
-    """
-    my_pos = ct.get_position()
-    _initialize_spiral_if_needed(ct, state, my_pos)
-
-    enemy_pos = _get_nearest_enemy_infrastructure(ct, my_pos)
-    if enemy_pos is not None:
-        follow_direction = _get_enemy_follow_direction(ct, state, my_pos, enemy_pos)
-        if follow_direction is not None:
-            _draw_intended_move(ct, follow_direction, 40, 220, 120)
-            follow_outcome = _try_move_with_infrastructure(ct, follow_direction, build_strategy="road")
-            if follow_outcome in ("moved", "detour_moved"):
-                state.explore_fail_streak = 0
-                _advance_spiral_after_success(state)
-                return
-            if follow_outcome == "cooldown":
-                return
-
-    spiral_direction = _get_spiral_direction(state)
-    _draw_intended_move(ct, spiral_direction, 80, 160, 255)
-    move_outcome = _try_move_with_infrastructure(ct, spiral_direction, build_strategy="road")
-
-    if move_outcome in ("moved", "detour_moved"):
-        state.explore_fail_streak = 0
-        _advance_spiral_after_success(state)
-        return
-
-    if move_outcome == "cooldown":
-        return
-
-    # Spiral step failed on terrain/blocking. Try rotating through remaining cardinal headings.
-    for _ in range(3):
-        _rotate_spiral_heading(state)
-        candidate_direction = _get_spiral_direction(state)
-        _draw_intended_move(ct, candidate_direction, 60, 200, 220)
-        move_outcome = _try_move_with_infrastructure(ct, candidate_direction, build_strategy="road")
-        if move_outcome in ("moved", "detour_moved"):
-            state.explore_fail_streak = 0
-            _advance_spiral_after_success(state)
-            return
-        if move_outcome == "cooldown":
+    # ===== BUILD IF BLOCKED =====
+    if not ct.is_tile_passable(next_pos):
+        if ct.can_build_conveyor(next_pos, back_dir):
+            ct.build_conveyor(next_pos, back_dir)
             return
 
-    loop_detected = _is_small_loop_pattern(state)
-    fallback_direction = _pick_explore_escape_direction(ct, state, my_pos) if loop_detected else _pick_explore_direction(ct, state, my_pos)
-    if fallback_direction is None:
-        state.explore_fail_streak += 1
-        _force_spiral_jump(state, ct)
-        return
+    # ===== MOVE =====
+    if ct.get_move_cooldown() == 0 and ct.can_move(move_dir):
+        ct.move(move_dir)
 
-    _draw_intended_move(ct, fallback_direction, 120, 120, 255)
-    fallback_outcome = _try_move_with_infrastructure(ct, fallback_direction, build_strategy="road")
-    if fallback_outcome in ("moved", "detour_moved"):
-        state.explore_fail_streak = 0
-        _advance_spiral_after_success(state)
-        return
 
-    if fallback_outcome == "cooldown":
-        return
+# ================= A* =================
 
-    state.explore_fail_streak += 1
-    _force_spiral_jump(state, ct)
-
-
-def _start_moving_to_ore(ct: Controller, state: BuilderBotState, visible_ore: list[Position]) -> bool:
-    """
-    Chooses the best visible ore and plans path to an orthogonally-adjacent build tile.
-    """
-    my_pos = ct.get_position()
-    best_choice = None
-
-    for ore_pos in sorted(visible_ore, key=lambda p: my_pos.distance_squared(p)):
-        goal_tile, path = _plan_path_to_ore_goal(ct, my_pos, ore_pos)
-        if goal_tile is None or path is None:
-            continue
-
-        path_cost = _path_cost(ct, my_pos, path)
-        candidate_key = (path_cost, len(path), my_pos.distance_squared(ore_pos))
-        if best_choice is None or candidate_key < best_choice[0]:
-            best_choice = (candidate_key, ore_pos, goal_tile, path)
-
-    if best_choice is None:
-        return False
-
-    _, ore_pos, goal_tile, path = best_choice
-    state.mode = MODE_MOVING_TO_ORE
-    state.target_ore = ore_pos
-    state.target_adjacent_tile = goal_tile
-    state.current_path = path
-    state.blocked_turns = 0
-    return True
-
-
-def _replan_to_current_target(ct: Controller, state: BuilderBotState, my_pos: Position) -> bool:
-    """
-    Replans to currently locked ore target.
-    """
-    if state.target_ore is None:
-        return False
-
-    goal_tile, path = _plan_path_to_ore_goal(ct, my_pos, state.target_ore)
-    if goal_tile is None or path is None:
-        return False
-
-    state.target_adjacent_tile = goal_tile
-    state.current_path = path
-    return True
-
-
-def _plan_path_to_ore_goal(ct: Controller, my_pos: Position, ore_pos: Position) -> tuple[Position | None, list[Direction] | None]:
-    """
-    Plans a path to an orthogonally adjacent tile to ore_pos.
-    """
-    if not _is_target_ore_valid(ct, ore_pos):
-        return None, None
-
-    orthogonal_directions = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST]
-    candidates = []
-
-    for direction in orthogonal_directions:
-        adjacent = ore_pos.add(direction)
-        if not logic_utils.is_position_in_bounds(ct, adjacent):
-            continue
-        if not ct.is_in_vision(adjacent):
-            continue
-
-        if _get_tile_move_cost(ct, adjacent, allow_goal=True) == IMPASSABLE_TILE_COST:
-            continue
-
-        if my_pos == adjacent:
-            path = []
-        else:
-            path = _a_star_path(ct, my_pos, adjacent)
-            if path is None:
-                continue
-
-        candidates.append((adjacent, path, _path_cost(ct, my_pos, path), len(path)))
-
-    if not candidates:
-        return None, None
-
-    candidates.sort(key=lambda c: (c[2], c[3]))
-    best_adjacent, best_path, _, _ = candidates[0]
-    return best_adjacent, best_path
-
-
-def _plan_return_path_to_core(ct: Controller, state: BuilderBotState, my_pos: Position) -> bool:
-    """
-    Plans a cardinal-only path to an orthogonally-adjacent tile near the allied core.
-    """
-    if state.core_position == Position(-1, -1):
-        return False
-
-    orthogonal_directions = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST]
-    candidates = []
-    for direction in orthogonal_directions:
-        goal = state.core_position.add(direction)
-        if not logic_utils.is_position_in_bounds(ct, goal):
-            continue
-        if not ct.is_in_vision(goal):
-            continue
-
-        if _get_tile_move_cost(ct, goal, allow_goal=True) == IMPASSABLE_TILE_COST:
-            continue
-
-        if my_pos == goal:
-            path = []
-        else:
-            path = _a_star_path(ct, my_pos, goal, cardinal_only=True)
-            if path is None:
-                continue
-
-        if not _path_steps_are_passable(ct, my_pos, path):
-            continue
-
-        candidates.append((goal, path, _path_cost(ct, my_pos, path), len(path)))
-
-    if not candidates:
-        return False
-
-    candidates.sort(key=lambda c: (c[2], c[3]))
-    best_goal, best_path, _, _ = candidates[0]
-    state.return_goal_tile = best_goal
-    state.return_path = best_path
-    return True
-
-
-def _get_return_conveyor_direction(ct: Controller, state: BuilderBotState) -> Direction:
-    """
-    Direction to use when placing conveyor on the next return tile.
-    """
-    if len(state.return_path) >= 2:
-        return _to_cardinal_direction(state.return_path[1], state.return_path[0])
-
-    next_pos = ct.get_position().add(state.return_path[0])
-    core_dir = next_pos.direction_to(state.core_position)
-    return _to_cardinal_direction(core_dir, state.return_path[0])
-
-
-def _to_cardinal_direction(direction: Direction, fallback: Direction) -> Direction:
-    """
-    Converts a direction to a cardinal direction. If input is diagonal,
-    choose the dominant axis; if equal, use fallback's axis.
-    """
-    if not _is_diagonal_direction(direction):
-        return direction
-
-    dx, dy = direction.delta()
-    fdx, fdy = fallback.delta()
-
-    if abs(dx) > abs(dy):
-        return Direction.EAST if dx > 0 else Direction.WEST
-    if abs(dy) > abs(dx):
-        return Direction.SOUTH if dy > 0 else Direction.NORTH
-
-    # Equal diagonal: prefer fallback axis if it is cardinal.
-    if fdx != 0 and fdy == 0:
-        return Direction.EAST if fdx > 0 else Direction.WEST
-    if fdy != 0 and fdx == 0:
-        return Direction.SOUTH if fdy > 0 else Direction.NORTH
-
-    return Direction.EAST if dx > 0 else Direction.WEST
-
-
-def _path_steps_are_passable(ct: Controller, start: Position, path: list[Direction]) -> bool:
-    """
-    Return routing is constrained to currently passable tiles so the builder can
-    traverse and selectively replace roads with conveyors.
-    """
-    position = start
-    for direction in path:
-        position = position.add(direction)
-        if not ct.is_in_vision(position):
-            return False
-        if not ct.is_tile_passable(position):
-            return False
-    return True
-
-
-def _update_known_map(ct: Controller, state: BuilderBotState) -> None:
-    """
-    Updates known map with current vision.
-    """
-    current_round = ct.get_current_round()
-    for tile in ct.get_nearby_tiles():
-        state.known_map[(tile.x, tile.y)] = (ct.get_tile_env(tile), current_round)
-
-
-def _try_cache_core_position(ct: Controller, state: BuilderBotState) -> None:
-    """
-    Caches allied core centre if visible.
-    """
-    my_team = ct.get_team()
-    for building_id in ct.get_nearby_buildings():
-        if ct.get_entity_type(building_id) == EntityType.CORE and ct.get_team(building_id) == my_team:
-            state.core_position = ct.get_position(building_id)
-            return
-
-
-def _get_visible_and_available_ore_tiles(ct: Controller) -> list[Position]:
-    """
-    Returns visible ore tiles with no building currently on top.
-    """
-    ore_tiles = []
-    for tile in ct.get_nearby_tiles():
-        env = ct.get_tile_env(tile)
-        if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE) and ct.get_tile_building_id(tile) is None:
-            ore_tiles.append(tile)
-    return ore_tiles
-
-
-def _pick_explore_direction(ct: Controller, state: BuilderBotState, my_pos: Position) -> Direction | None:
-    """
-    Picks best local exploration direction using:
-    - terrain/move cost
-    - distance from core
-    - stale/unknown map signal
-    - recent local movement memory
-    - fresh allied visit markers
-    """
-    candidates: list[tuple[float, Direction, Position]] = []
-    current_round = ct.get_current_round()
-    previous_pos = _get_previous_position(state)
-
-    for direction in DIRECTIONS:
-        tile = my_pos.add(direction)
-        if not logic_utils.is_position_in_bounds(ct, tile):
-            continue
-
-        tile_cost = _get_tile_move_cost(ct, tile, allow_goal=True)
-        if tile_cost == IMPASSABLE_TILE_COST:
-            continue
-
-        score = -5 * tile_cost
-        if state.core_position != Position(-1, -1):
-            score += 2 * tile.distance_squared(state.core_position)
-
-        seen = state.known_map.get((tile.x, tile.y))
-        if seen is None:
-            score += 200
-        else:
-            _, seen_round = seen
-            score += min(50, current_round - seen_round)
-
-        if previous_pos is not None and tile == previous_pos:
-            score -= EXPLORATION_BACKTRACK_PENALTY
-
-        for idx in range(len(state.recent_positions) - 1, -1, -1):
-            previous_xy = state.recent_positions[idx]
-            if previous_xy == (tile.x, tile.y):
-                recency_rank = len(state.recent_positions) - 1 - idx
-                score -= max(10, EXPLORATION_RECENT_TILE_PENALTY - (12 * recency_rank))
-                break
-
-        visit_round = _read_visit_marker_round(ct, tile)
-        if visit_round is not None:
-            age = max(0, current_round - visit_round)
-            if age < VISIT_MARKER_FRESH_ROUNDS:
-                penalty = VISIT_MARKER_MAX_PENALTY - int((VISIT_MARKER_MAX_PENALTY * age) / VISIT_MARKER_FRESH_ROUNDS)
-                score -= penalty
-
-        candidates.append((score, direction, tile))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
-
-
-def _initialize_spiral_if_needed(ct: Controller, state: BuilderBotState, my_pos: Position) -> None:
-    """
-    Initializes spiral heading once. We bias initial direction away from core,
-    and spread builders with an ID-based tie-break when on/near center.
-    """
-    if state.spiral_initialized:
-        return
-
-    # Cardinal order used by the square spiral.
-    # 0:EAST, 1:SOUTH, 2:WEST, 3:NORTH
-    if state.core_position != Position(-1, -1):
-        dx = my_pos.x - state.core_position.x
-        dy = my_pos.y - state.core_position.y
-
-        if abs(dx) > abs(dy):
-            state.spiral_heading_idx = 0 if dx >= 0 else 2
-        elif abs(dy) > 0:
-            state.spiral_heading_idx = 1 if dy >= 0 else 3
-        else:
-            state.spiral_heading_idx = ct.get_id() % 4
-    else:
-        state.spiral_heading_idx = ct.get_id() % 4
-
-    state.spiral_leg_length = 1
-    state.spiral_steps_on_leg = 0
-    state.spiral_legs_completed = 0
-    state.spiral_initialized = True
-
-
-def _get_spiral_direction(state: BuilderBotState) -> Direction:
-    directions = [Direction.EAST, Direction.SOUTH, Direction.WEST, Direction.NORTH]
-    return directions[state.spiral_heading_idx % 4]
-
-
-def _rotate_spiral_heading(state: BuilderBotState) -> None:
-    state.spiral_heading_idx = (state.spiral_heading_idx + 1) % 4
-
-
-def _advance_spiral_after_success(state: BuilderBotState) -> None:
-    """
-    Advance square-spiral counters after a successful exploration move.
-    Spiral leg lengths grow as 1,1,2,2,3,3,...
-    """
-    state.spiral_steps_on_leg += 1
-    if state.spiral_steps_on_leg < state.spiral_leg_length:
-        return
-
-    state.spiral_steps_on_leg = 0
-    state.spiral_heading_idx = (state.spiral_heading_idx + 1) % 4
-    state.spiral_legs_completed += 1
-    if state.spiral_legs_completed % 2 == 0:
-        state.spiral_leg_length += 1
-
-
-def _get_nearest_enemy_infrastructure(ct: Controller, my_pos: Position) -> Position | None:
-    """
-    Returns nearest visible enemy building position (excluding markers).
-    """
-    my_team = ct.get_team()
-    nearest = None
-    nearest_dist = float("inf")
-
-    for building_id in ct.get_nearby_buildings():
-        if ct.get_team(building_id) == my_team:
-            continue
-        if ct.get_entity_type(building_id) == EntityType.MARKER:
-            continue
-
-        enemy_pos = ct.get_position(building_id)
-        dist = my_pos.distance_squared(enemy_pos)
-        if dist < nearest_dist:
-            nearest_dist = dist
-            nearest = enemy_pos
-
-    return nearest
-
-
-def _get_enemy_follow_direction(ct: Controller, state: BuilderBotState, my_pos: Position, enemy_pos: Position) -> Direction | None:
-    """
-    Returns a direction that moves roughly tangentially along enemy infrastructure,
-    instead of turning directly away.
-
-    We try both tangential directions around the enemy vector, then fallback to
-    a short local scoring pass for legal candidates.
-    """
-    dx = enemy_pos.x - my_pos.x
-    dy = enemy_pos.y - my_pos.y
-
-    # Tangent vectors relative to enemy vector (dx, dy): (-dy, dx) and (dy, -dx)
-    tangential_dirs = _dirs_from_delta_priority(-dy, dx) + _dirs_from_delta_priority(dy, -dx)
-
-    for direction in tangential_dirs:
-        if direction == Direction.CENTRE:
-            continue
-        outcome = _simulate_move_legality(ct, direction)
-        if outcome == "ok":
-            return direction
-
-    # Secondary option: pick a nearby direction that stays mobile and avoids immediate backtrack.
-    best = None
-    previous_pos = _get_previous_position(state)
-    for direction in DIRECTIONS:
-        outcome = _simulate_move_legality(ct, direction)
-        if outcome == "blocked":
-            continue
-
-        tile = my_pos.add(direction)
-        score = 0.0
-        if previous_pos is not None and tile == previous_pos:
-            score -= EXPLORATION_BACKTRACK_PENALTY
-
-        # Prefer progressing outward while tracing enemy edge.
-        if state.core_position != Position(-1, -1):
-            score += tile.distance_squared(state.core_position)
-
-        # Prefer staying close enough to continue edge-follow behaviour.
-        score -= 0.4 * tile.distance_squared(enemy_pos)
-
-        if best is None or score > best[0]:
-            best = (score, direction)
-
-    if best is None:
-        return None
-    return best[1]
-
-
-def _dirs_from_delta_priority(dx: int, dy: int) -> list[Direction]:
-    """
-    Converts a free-form delta intent into an ordered list of candidate directions.
-    """
-    primary = _direction_from_sign(dx, dy)
-    candidates = []
-    if primary is not None:
-        candidates.append(primary)
-
-    if dx != 0 and dy != 0:
-        cardinal_x = Direction.EAST if dx > 0 else Direction.WEST
-        cardinal_y = Direction.SOUTH if dy > 0 else Direction.NORTH
-        candidates.extend([cardinal_x, cardinal_y])
-    elif dx != 0:
-        candidates.append(Direction.EAST if dx > 0 else Direction.WEST)
-    elif dy != 0:
-        candidates.append(Direction.SOUTH if dy > 0 else Direction.NORTH)
-
-    # De-duplicate while preserving order.
-    deduped = []
-    for direction in candidates:
-        if direction not in deduped:
-            deduped.append(direction)
-    return deduped
-
-
-def _direction_from_sign(dx: int, dy: int) -> Direction | None:
-    sx = 0 if dx == 0 else (1 if dx > 0 else -1)
-    sy = 0 if dy == 0 else (1 if dy > 0 else -1)
-
-    mapping = {
-        (1, 0): Direction.EAST,
-        (-1, 0): Direction.WEST,
-        (0, 1): Direction.SOUTH,
-        (0, -1): Direction.NORTH,
-        (1, 1): Direction.SOUTHEAST,
-        (1, -1): Direction.NORTHEAST,
-        (-1, 1): Direction.SOUTHWEST,
-        (-1, -1): Direction.NORTHWEST,
-    }
-    return mapping.get((sx, sy))
-
-
-def _simulate_move_legality(ct: Controller, direction: Direction) -> str:
-    """
-    Cheap movement viability check used by exploration steering.
-    Returns "ok" or "blocked".
-    """
-    if ct.get_move_cooldown() > 0:
-        return "blocked"
-
-    if ct.can_move(direction):
-        return "ok"
-
-    my_pos = ct.get_position()
-    next_pos = my_pos.add(direction)
-    if not logic_utils.is_position_in_bounds(ct, next_pos):
-        return "blocked"
-
-    if not ct.is_in_vision(next_pos):
-        return "blocked"
-
-    if _is_diagonal_direction(direction):
-        detour = _choose_diagonal_detour(ct, direction, "road")
-        if detour is not None:
-            return "ok"
-
-    occupying_builder_id = ct.get_tile_builder_bot_id(next_pos)
-    if occupying_builder_id is not None and occupying_builder_id != ct.get_id():
-        return "blocked"
-
-    if ct.can_build_road(next_pos):
-        return "ok"
-
-    return "blocked"
-
-
-def _is_small_loop_pattern(state: BuilderBotState) -> bool:
-    """
-    Detects tight exploration loops like A-B-A-B and 3-tile cycles.
-    """
-    if len(state.recent_positions) < 6:
-        return False
-
-    window = state.recent_positions[-6:]
-    if len(set(window)) <= 3:
-        return True
-
-    # 2-cycle: p0==p2==p4 and p1==p3==p5
-    if window[0] == window[2] == window[4] and window[1] == window[3] == window[5]:
-        return True
-
-    return False
-
-
-def _pick_explore_escape_direction(ct: Controller, state: BuilderBotState, my_pos: Position) -> Direction | None:
-    """
-    Aggressive loop-break direction picker for side/corner traps.
-    """
-    best = None
-    current_round = ct.get_current_round()
-    recent_set = set(state.recent_positions[-EXPLORATION_MEMORY_WINDOW:])
-
-    for direction in DIRECTIONS:
-        outcome = _simulate_move_legality(ct, direction)
-        if outcome == "blocked":
-            continue
-
-        tile = my_pos.add(direction)
-        score = 0.0
-
-        if (tile.x, tile.y) in recent_set:
-            score -= 250
-
-        # Strong outward pressure from core.
-        if state.core_position != Position(-1, -1):
-            score += 3.0 * tile.distance_squared(state.core_position)
-
-        # Prefer unknown/stale tiles.
-        seen = state.known_map.get((tile.x, tile.y))
-        if seen is None:
-            score += 150
-        else:
-            _, seen_round = seen
-            score += min(40, current_round - seen_round)
-
-        if best is None or score > best[0]:
-            best = (score, direction)
-
-    if best is None:
-        return None
-    return best[1]
-
-
-def _force_spiral_jump(state: BuilderBotState, ct: Controller) -> None:
-    """
-    Deterministically perturbs spiral state to break side/corner dead cycles.
-    """
-    jump = 1 + ((ct.get_current_round() + ct.get_id()) % 3)
-    state.spiral_heading_idx = (state.spiral_heading_idx + jump) % 4
-    state.spiral_steps_on_leg = 0
-    state.spiral_leg_length = min(state.spiral_leg_length + 1, 9)
-    state.spiral_legs_completed += 1
-
-
-def _a_star_path(ct: Controller, start: Position, goal: Position, cardinal_only: bool = False) -> list[Direction] | None:
-    """
-    Weighted A* search with a node budget cap.
-    """
+def _a_star_next_direction(ct: Controller, start: Position, goal: Position) -> Direction | None:
     if start == goal:
         return []
 
     open_heap = []
-    heapq.heappush(open_heap, (logic_utils.chebyshev_distance(start, goal), 0, start))
+    heapq.heappush(open_heap, (0, 0, start))
 
-    came_from: dict[Position, Position] = {}
-    g_score: dict[Position, float] = {start: 0}
-    already_explored: set[Position] = set()
-    tie_breaker = 0
-    expanded_nodes = 0
+    came_from = {}
+    g_score = {start: 0}
+    visited = set()
+    tie = 0
 
-    while open_heap and expanded_nodes < PATHFIND_NODE_BUDGET:
+    while open_heap:
         _, _, current = heapq.heappop(open_heap)
-        if current in already_explored:
+
+        if current in visited:
             continue
+        visited.add(current)
 
         if current == goal:
             return _reconstruct_path(start, goal, came_from)
 
-        already_explored.add(current)
-        expanded_nodes += 1
-
-        search_dirs = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST] if cardinal_only else DIRECTIONS
-        for direction in search_dirs:
-            neighbor = current.add(direction)
+        for d in DIRECTIONS:
+            neighbor = current.add(d)
 
             if not logic_utils.is_position_in_bounds(ct, neighbor):
                 continue
             if not ct.is_in_vision(neighbor):
                 continue
-            if neighbor in already_explored:
+            if neighbor in visited:
                 continue
 
-            move_cost = _get_tile_move_cost(ct, neighbor, allow_goal=(neighbor == goal))
-            if move_cost == IMPASSABLE_TILE_COST:
+            # ONLY walkable tiles
+            if not ct.is_tile_passable(neighbor) and neighbor != goal:
                 continue
 
-            tentative_g = g_score[current] + move_cost
+            tentative_g = g_score[current] + 1
+
             if tentative_g >= g_score.get(neighbor, float("inf")):
                 continue
 
             came_from[neighbor] = current
             g_score[neighbor] = tentative_g
-            tie_breaker += 1
-            heuristic = logic_utils.chebyshev_distance(neighbor, goal) * PASSABLE_TILE_COST
-            f_score = tentative_g + heuristic
-            heapq.heappush(open_heap, (f_score, tie_breaker, neighbor))
+
+            tie += 1
+            h = logic_utils.chebyshev_distance(neighbor, goal)
+            f = tentative_g + h
+
+            heapq.heappush(open_heap, (f, tie, neighbor))
 
     return None
 
 
-def _reconstruct_path(start: Position, goal: Position, came_from: dict[Position, Position]) -> list[Direction] | None:
-    """
-    Reconstructs direction list from A* predecessor map.
-    """
-    if start == goal:
-        return []
-
+def _reconstruct_next_direction(start: Position, goal: Position, came_from):
     if goal not in came_from:
         return None
 
     nodes = [goal]
     node = goal
-    while node != start:
+    while node in came_from and came_from[node] != start:
         node = came_from[node]
         nodes.append(node)
 
@@ -1180,116 +395,58 @@ def _choose_diagonal_detour(ct: Controller, diagonal_direction: Direction, build
     return None
 
 
-def _get_tile_move_cost(ct: Controller, pos: Position, allow_goal: bool = False) -> float:
-    """
-    Returns tile move cost based on navigability and passability.
-    """
-    if not _is_navigable_tile(ct, pos, allow_goal=allow_goal):
-        return IMPASSABLE_TILE_COST
+# ================= TARGETING =================
 
-    if ct.is_tile_passable(pos):
-        return PASSABLE_TILE_COST
-
-    return EMPTY_TILE_COST
-
-
-def _is_navigable_tile(ct: Controller, pos: Position, allow_goal: bool = False) -> bool:
-    """
-    Returns whether tile can be considered route-navigable for pathfinding.
-    """
-    if not logic_utils.is_position_in_bounds(ct, pos):
-        return False
-
-    if not ct.is_in_vision(pos):
-        return False
-
-    occupying_builder_id = ct.get_tile_builder_bot_id(pos)
-    if occupying_builder_id is not None and occupying_builder_id != ct.get_id():
-        return False
-
-    env = ct.get_tile_env(pos)
-    if env == Environment.WALL:
-        return False
-
-    building_id = ct.get_tile_building_id(pos)
-    if building_id is not None:
-        building_type = ct.get_entity_type(building_id)
-
-        if building_type in (EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR, EntityType.ROAD):
-            return True
-        if building_type == EntityType.CORE and ct.get_team(building_id) == ct.get_team():
-            return True
-
-        return False
-
-    return env in (Environment.EMPTY, Environment.ORE_TITANIUM, Environment.ORE_AXIONITE)
-
-
-def _record_recent_position(state: BuilderBotState, pos: Position) -> None:
-    """
-    Tracks a short rolling history of this bot's recent positions.
-    """
-    xy = (pos.x, pos.y)
-    state.recent_positions.append(xy)
-    if len(state.recent_positions) > EXPLORATION_MEMORY_WINDOW:
-        state.recent_positions.pop(0)
-
-
-def _get_previous_position(state: BuilderBotState) -> Position | None:
-    """
-    Returns immediately previous position if available.
-    """
-    if len(state.recent_positions) < 2:
-        return None
-
-    x, y = state.recent_positions[-2]
-    return Position(x, y)
-
-
-def _encode_marker_value(kind: int, payload: int) -> int:
-    payload_clamped = payload & MARKER_PAYLOAD_MASK
-    return (kind << MARKER_KIND_SHIFT) | payload_clamped
-
-
-def _decode_marker_value(value: int) -> tuple[int, int]:
-    kind = value >> MARKER_KIND_SHIFT
-    payload = value & MARKER_PAYLOAD_MASK
-    return kind, payload
-
-
-def _try_place_visit_marker(ct: Controller) -> None:
-    """
-    Places a friendly visit marker on current tile when legal.
-    """
-    current_pos = ct.get_position()
-    if ct.can_place_marker(current_pos):
-        marker_value = _encode_marker_value(MARKER_KIND_VISIT, ct.get_current_round())
-        ct.place_marker(current_pos, marker_value)
-
-
-def _read_visit_marker_round(ct: Controller, pos: Position) -> int | None:
-    """
-    Reads visit round from friendly marker at pos when available.
-    """
-    if not ct.is_in_vision(pos):
-        return None
-
-    building_id = ct.get_tile_building_id(pos)
-    if building_id is None:
-        return None
-
-    if ct.get_entity_type(building_id) != EntityType.MARKER:
-        return None
-
-    if ct.get_team(building_id) != ct.get_team():
-        return None
-
-    marker_value = ct.get_marker_value(building_id)
-    marker_kind, marker_payload = _decode_marker_value(marker_value)
-    if marker_kind == MARKER_KIND_VISIT:
-        return marker_payload
-
-    if marker_kind == MARKER_KIND_CORE_SPAWN_LANE:
-        return None
-
+def _get_adjacent_build_tile(ct: Controller, ore_pos: Position) -> Position | None:
+    for d in DIRECTIONS:
+        adj = ore_pos.add(d)
+        if logic_utils.is_position_in_bounds(ct, adj) and ct.is_tile_passable(adj):
+            return adj
     return None
+
+
+def _get_visible_ore_tiles(ct: Controller):
+    ore_tiles = []
+    for tile in ct.get_nearby_tiles():
+        env = ct.get_tile_env(tile)
+        if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+            ore_tiles.append(tile)
+    return ore_tiles
+
+
+# ================= EXPLORATION =================
+
+def _pick_explore_target(ct: Controller, state: BuilderBotState, my_pos: Position):
+    candidates = []
+
+    for d in DIRECTIONS:
+        tile = my_pos.add(d)
+        if not logic_utils.is_position_in_bounds(ct, tile):
+            continue
+        if ct.is_tile_passable(tile):
+            candidates.append(tile)
+
+    if not candidates:
+        return None
+
+    # move away from core
+    if state.core_position != Position(-1, -1):
+        return max(candidates, key=lambda p: p.distance_squared(state.core_position))
+
+    return random.choice(candidates)
+
+
+# ================= UTIL =================
+
+def _update_known_map(ct: Controller, state: BuilderBotState):
+    round_num = ct.get_current_round()
+    for tile in ct.get_nearby_tiles():
+        state.known_map[(tile.x, tile.y)] = (ct.get_tile_env(tile), round_num)
+
+
+def _try_cache_core_position(ct: Controller, state: BuilderBotState):
+    my_team = ct.get_team()
+    for bid in ct.get_nearby_buildings():
+        if ct.get_entity_type(bid) == EntityType.CORE and ct.get_team(bid) == my_team:
+            state.core_position = ct.get_position(bid)
+            return

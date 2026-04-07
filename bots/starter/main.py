@@ -24,7 +24,7 @@ class Player:
     def run(self, ct: Controller) -> None:
         etype = ct.get_entity_type()
         if etype == EntityType.CORE:
-            if self.num_spawned < 3:
+            if self.num_spawned < 7:
                 # if we haven't spawned 3 builder bots yet, try to spawn one on a random tile
                 spawn_pos = ct.get_position().add(random.choice(DIRECTIONS))
                 if ct.can_spawn(spawn_pos):
@@ -41,13 +41,11 @@ class Player:
             # move in a random direction
             move_dir = random.choice(DIRECTIONS)
             move_pos = ct.get_position().add(move_dir)
+            back_dir = move_dir.opposite()
             # we need to place a conveyor or road to stand on, before we can move onto a tile
-            if ct.can_build_road(move_pos):
-                ct.build_road(move_pos)
+            if ct.can_build_conveyor(move_pos, back_dir):
+                ct.build_conveyor(move_pos,back_dir)
             if ct.can_move(move_dir):
                 ct.move(move_dir)
 
-            # place a marker on an adjacent tile with the current round number
-            marker_pos = ct.get_position().add(random.choice(DIRECTIONS))
-            if ct.can_place_marker(marker_pos):
-                ct.place_marker(marker_pos, ct.get_current_round())
+            
