@@ -14,6 +14,7 @@ from constants import (
     MODE_EXPLORING,
     MODE_IDLE,
     MODE_MOVING_TO_ORE,
+    MODE_RETURNING_TO_CORE,
     PASSABLE_TILE_COST,
     PATHFIND_NODE_BUDGET,
     VISIT_MARKER_FRESH_ROUNDS,
@@ -34,8 +35,9 @@ class BuilderBotState:
     Important fields:
     - mode: high-level FSM mode.
     - target_ore: ore tile currently locked in MOVING_TO_ORE.
-    - target_adjacent_tile: orthogonally-adjacent build tile chosen for target_ore.
+    - return_goal_tile: core-adjacent tile chosen for return routing.
     - current_path: queued list of movement directions.
+    - return_path: queued cardinal directions used while returning to core.
     - blocked_turns: retry counter for temporary blockage.
     - known_map: maps (x, y) -> (Environment, last_seen_round).
     - recent_positions: short local memory used to break small exploration loops.
@@ -49,7 +51,9 @@ class BuilderBotState:
         self.mode = MODE_IDLE
         self.target_ore: Position | None = None
         self.target_adjacent_tile: Position | None = None
+        self.return_goal_tile: Position | None = None
         self.current_path: list[Direction] = []
+        self.return_path: list[Direction] = []
         self.blocked_turns = 0
 
         self.known_map: dict[tuple[int, int], tuple[Environment, int]] = {}
@@ -88,6 +92,10 @@ def execute_behaviour(ct: Controller, state: BuilderBotState) -> None:
 
     if state.mode == MODE_MOVING_TO_ORE:
         _run_moving_to_ore(ct, state)
+        return
+
+    if state.mode == MODE_RETURNING_TO_CORE:
+        _run_returning_to_core(ct, state)
         return
 
     visible_ore = _get_visible_and_available_ore_tiles(ct)
@@ -134,7 +142,7 @@ def _run_moving_to_ore(ct: Controller, state: BuilderBotState) -> None:
     next_direction = state.current_path[0]
     _draw_intended_move(ct, next_direction, 255, 170, 0)
     _draw_target_line(ct, state.target_ore, 255, 80, 80)
-    move_outcome = _try_move_with_optional_conveyor(ct, next_direction)
+    move_outcome = _try_move_with_infrastructure(ct, next_direction, build_strategy="road")
     print_debug_msg(
         ct,
         f"Trying to move {next_direction} towards ore at {state.target_ore}, outcome: {move_outcome}, blocked_turns: {state.blocked_turns}",
@@ -170,6 +178,68 @@ def _run_moving_to_ore(ct: Controller, state: BuilderBotState) -> None:
     _enter_exploring(state)
 
 
+def _run_returning_to_core(ct: Controller, state: BuilderBotState) -> None:
+    """
+    Return to allied core while replacing road tiles on the chosen route with
+    conveyors that point toward the core.
+    """
+    if state.core_position == Position(-1, -1):
+        _enter_exploring(state)
+        return
+
+    my_pos = ct.get_position()
+    if state.return_goal_tile is not None and my_pos == state.return_goal_tile:
+        _reset_after_return_complete(state)
+        return
+
+    if not state.return_path:
+        if not _plan_return_path_to_core(ct, state, my_pos):
+            state.blocked_turns += 1
+            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
+                _enter_exploring(state)
+            return
+        state.blocked_turns = 0
+
+    if not state.return_path:
+        _reset_after_return_complete(state)
+        return
+
+    next_direction = state.return_path[0]
+    conveyor_direction = _get_return_conveyor_direction(ct, state)
+    _draw_intended_move(ct, next_direction, 255, 230, 90)
+    move_outcome = _try_move_with_infrastructure(
+        ct,
+        next_direction,
+        build_strategy="conveyor",
+        conveyor_direction=conveyor_direction,
+        replace_road_only=True,
+    )
+
+    if move_outcome == "moved":
+        state.return_path.pop(0)
+        state.blocked_turns = 0
+        return
+
+    if move_outcome == "detour_moved":
+        if _plan_return_path_to_core(ct, state, ct.get_position()):
+            state.blocked_turns = 0
+        else:
+            state.blocked_turns += 1
+            if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
+                _enter_exploring(state)
+        return
+
+    if move_outcome == "cooldown":
+        return
+
+    if _plan_return_path_to_core(ct, state, ct.get_position()):
+        state.blocked_turns = 0
+    else:
+        state.blocked_turns += 1
+        if state.blocked_turns > MAX_TEMP_BLOCKED_TURNS:
+            _enter_exploring(state)
+
+
 def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
     """
     Exploration uses a core-anchored outward square-spiral as primary behaviour.
@@ -177,7 +247,6 @@ def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
     Fallback local scoring is kept as a safety net for blocked terrain pockets.
     """
     my_pos = ct.get_position()
-
     _initialize_spiral_if_needed(ct, state, my_pos)
 
     enemy_pos = _get_nearest_enemy_infrastructure(ct, my_pos)
@@ -185,7 +254,7 @@ def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
         follow_direction = _get_enemy_follow_direction(ct, state, my_pos, enemy_pos)
         if follow_direction is not None:
             _draw_intended_move(ct, follow_direction, 40, 220, 120)
-            follow_outcome = _try_move_with_optional_conveyor(ct, follow_direction)
+            follow_outcome = _try_move_with_infrastructure(ct, follow_direction, build_strategy="road")
             if follow_outcome in ("moved", "detour_moved"):
                 state.explore_fail_streak = 0
                 _advance_spiral_after_success(state)
@@ -195,7 +264,7 @@ def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
 
     spiral_direction = _get_spiral_direction(state)
     _draw_intended_move(ct, spiral_direction, 80, 160, 255)
-    move_outcome = _try_move_with_optional_conveyor(ct, spiral_direction)
+    move_outcome = _try_move_with_infrastructure(ct, spiral_direction, build_strategy="road")
 
     if move_outcome in ("moved", "detour_moved"):
         state.explore_fail_streak = 0
@@ -205,13 +274,12 @@ def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
     if move_outcome == "cooldown":
         return
 
-    # Spiral step failed on terrain/blocking. Try rotating through remaining cardinal headings
-    # so we can escape corners and continue expanding.
+    # Spiral step failed on terrain/blocking. Try rotating through remaining cardinal headings.
     for _ in range(3):
         _rotate_spiral_heading(state)
         candidate_direction = _get_spiral_direction(state)
         _draw_intended_move(ct, candidate_direction, 60, 200, 220)
-        move_outcome = _try_move_with_optional_conveyor(ct, candidate_direction)
+        move_outcome = _try_move_with_infrastructure(ct, candidate_direction, build_strategy="road")
         if move_outcome in ("moved", "detour_moved"):
             state.explore_fail_streak = 0
             _advance_spiral_after_success(state)
@@ -227,7 +295,7 @@ def _run_exploring(ct: Controller, state: BuilderBotState) -> None:
         return
 
     _draw_intended_move(ct, fallback_direction, 120, 120, 255)
-    fallback_outcome = _try_move_with_optional_conveyor(ct, fallback_direction)
+    fallback_outcome = _try_move_with_infrastructure(ct, fallback_direction, build_strategy="road")
     if fallback_outcome in ("moved", "detour_moved"):
         state.explore_fail_streak = 0
         _advance_spiral_after_success(state)
@@ -320,6 +388,99 @@ def _plan_path_to_ore_goal(ct: Controller, my_pos: Position, ore_pos: Position) 
     candidates.sort(key=lambda c: (c[2], c[3]))
     best_adjacent, best_path, _, _ = candidates[0]
     return best_adjacent, best_path
+
+
+def _plan_return_path_to_core(ct: Controller, state: BuilderBotState, my_pos: Position) -> bool:
+    """
+    Plans a cardinal-only path to an orthogonally-adjacent tile near the allied core.
+    """
+    if state.core_position == Position(-1, -1):
+        return False
+
+    orthogonal_directions = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST]
+    candidates = []
+    for direction in orthogonal_directions:
+        goal = state.core_position.add(direction)
+        if not logic_utils.is_position_in_bounds(ct, goal):
+            continue
+        if not ct.is_in_vision(goal):
+            continue
+
+        if _get_tile_move_cost(ct, goal, allow_goal=True) == IMPASSABLE_TILE_COST:
+            continue
+
+        if my_pos == goal:
+            path = []
+        else:
+            path = _a_star_path(ct, my_pos, goal, cardinal_only=True)
+            if path is None:
+                continue
+
+        if not _path_steps_are_passable(ct, my_pos, path):
+            continue
+
+        candidates.append((goal, path, _path_cost(ct, my_pos, path), len(path)))
+
+    if not candidates:
+        return False
+
+    candidates.sort(key=lambda c: (c[2], c[3]))
+    best_goal, best_path, _, _ = candidates[0]
+    state.return_goal_tile = best_goal
+    state.return_path = best_path
+    return True
+
+
+def _get_return_conveyor_direction(ct: Controller, state: BuilderBotState) -> Direction:
+    """
+    Direction to use when placing conveyor on the next return tile.
+    """
+    if len(state.return_path) >= 2:
+        return _to_cardinal_direction(state.return_path[1], state.return_path[0])
+
+    next_pos = ct.get_position().add(state.return_path[0])
+    core_dir = next_pos.direction_to(state.core_position)
+    return _to_cardinal_direction(core_dir, state.return_path[0])
+
+
+def _to_cardinal_direction(direction: Direction, fallback: Direction) -> Direction:
+    """
+    Converts a direction to a cardinal direction. If input is diagonal,
+    choose the dominant axis; if equal, use fallback's axis.
+    """
+    if not _is_diagonal_direction(direction):
+        return direction
+
+    dx, dy = direction.delta()
+    fdx, fdy = fallback.delta()
+
+    if abs(dx) > abs(dy):
+        return Direction.EAST if dx > 0 else Direction.WEST
+    if abs(dy) > abs(dx):
+        return Direction.SOUTH if dy > 0 else Direction.NORTH
+
+    # Equal diagonal: prefer fallback axis if it is cardinal.
+    if fdx != 0 and fdy == 0:
+        return Direction.EAST if fdx > 0 else Direction.WEST
+    if fdy != 0 and fdx == 0:
+        return Direction.SOUTH if fdy > 0 else Direction.NORTH
+
+    return Direction.EAST if dx > 0 else Direction.WEST
+
+
+def _path_steps_are_passable(ct: Controller, start: Position, path: list[Direction]) -> bool:
+    """
+    Return routing is constrained to currently passable tiles so the builder can
+    traverse and selectively replace roads with conveyors.
+    """
+    position = start
+    for direction in path:
+        position = position.add(direction)
+        if not ct.is_in_vision(position):
+            return False
+        if not ct.is_tile_passable(position):
+            return False
+    return True
 
 
 def _update_known_map(ct: Controller, state: BuilderBotState) -> None:
@@ -602,7 +763,7 @@ def _simulate_move_legality(ct: Controller, direction: Direction) -> str:
         return "blocked"
 
     if _is_diagonal_direction(direction):
-        detour = _choose_diagonal_detour(ct, direction)
+        detour = _choose_diagonal_detour(ct, direction, "road")
         if detour is not None:
             return "ok"
 
@@ -610,8 +771,7 @@ def _simulate_move_legality(ct: Controller, direction: Direction) -> str:
     if occupying_builder_id is not None and occupying_builder_id != ct.get_id():
         return "blocked"
 
-    back_direction = next_pos.direction_to(my_pos)
-    if not _is_diagonal_direction(back_direction) and ct.can_build_conveyor(next_pos, back_direction):
+    if ct.can_build_road(next_pos):
         return "ok"
 
     return "blocked"
@@ -685,7 +845,7 @@ def _force_spiral_jump(state: BuilderBotState, ct: Controller) -> None:
     state.spiral_legs_completed += 1
 
 
-def _a_star_path(ct: Controller, start: Position, goal: Position) -> list[Direction] | None:
+def _a_star_path(ct: Controller, start: Position, goal: Position, cardinal_only: bool = False) -> list[Direction] | None:
     """
     Weighted A* search with a node budget cap.
     """
@@ -712,7 +872,8 @@ def _a_star_path(ct: Controller, start: Position, goal: Position) -> list[Direct
         already_explored.add(current)
         expanded_nodes += 1
 
-        for direction in DIRECTIONS:
+        search_dirs = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST] if cardinal_only else DIRECTIONS
+        for direction in search_dirs:
             neighbor = current.add(direction)
 
             if not logic_utils.is_position_in_bounds(ct, neighbor):
@@ -774,7 +935,13 @@ def _path_cost(ct: Controller, start: Position, path: list[Direction]) -> float:
     return total
 
 
-def _try_move_with_optional_conveyor(ct: Controller, direction: Direction) -> str:
+def _try_move_with_infrastructure(
+    ct: Controller,
+    direction: Direction,
+    build_strategy: str = "road",
+    conveyor_direction: Direction | None = None,
+    replace_road_only: bool = False,
+) -> str:
     """
     Returns one of:
     - moved
@@ -786,16 +953,17 @@ def _try_move_with_optional_conveyor(ct: Controller, direction: Direction) -> st
     if ct.get_move_cooldown() > 0:
         return "cooldown"
 
-    if ct.can_move(direction):
-        ct.move(direction)
-        return "moved"
-
-    # If a diagonal target tile is currently unwalkable, we cannot fix it by placing
-    # a diagonal conveyor. Try one-step cardinal detour and let caller replan.
+    # If a diagonal target tile is currently unwalkable, use one-step cardinal detour.
     if _is_diagonal_direction(direction):
-        detour = _choose_diagonal_detour(ct, direction)
+        detour = _choose_diagonal_detour(ct, direction, build_strategy)
         if detour is not None:
-            detour_outcome = _try_move_with_optional_conveyor(ct, detour)
+            detour_outcome = _try_move_with_infrastructure(
+                ct,
+                detour,
+                build_strategy,
+                conveyor_direction=conveyor_direction,
+                replace_road_only=replace_road_only,
+            )
             if detour_outcome in ("moved", "detour_moved"):
                 return "detour_moved"
 
@@ -808,12 +976,54 @@ def _try_move_with_optional_conveyor(ct: Controller, direction: Direction) -> st
     if occupying_builder_id is not None and occupying_builder_id != ct.get_id():
         return "temporary_block"
 
-    back_direction = next_pos.direction_to(my_pos)
-    if not _is_diagonal_direction(back_direction) and ct.can_build_conveyor(next_pos, back_direction):
-        ct.build_conveyor(next_pos, back_direction)
-        if ct.can_move(direction):
-            ct.move(direction)
-            return "moved"
+    # Return-mode special handling: replace road with conveyor before moving.
+    if build_strategy == "conveyor":
+        desired_dir = conveyor_direction if conveyor_direction is not None else direction
+        desired_dir = _to_cardinal_direction(desired_dir, direction)
+
+        if replace_road_only:
+            building_id = ct.get_tile_building_id(next_pos)
+            if building_id is not None and ct.get_entity_type(building_id) == EntityType.ROAD and ct.get_team(building_id) == ct.get_team():
+                if ct.can_destroy(next_pos):
+                    ct.destroy(next_pos)
+
+                if ct.can_build_conveyor(next_pos, desired_dir):
+                    ct.build_conveyor(next_pos, desired_dir)
+
+    if ct.can_move(direction):
+        ct.move(direction)
+        return "moved"
+
+    if build_strategy == "road":
+        if ct.can_build_road(next_pos):
+            ct.build_road(next_pos)
+            if ct.can_move(direction):
+                ct.move(direction)
+                return "moved"
+
+    if build_strategy == "conveyor":
+        desired_dir = conveyor_direction if conveyor_direction is not None else direction
+        desired_dir = _to_cardinal_direction(desired_dir, direction)
+        if not _is_diagonal_direction(desired_dir):
+            road_replaced = not replace_road_only
+            if replace_road_only:
+                building_id = ct.get_tile_building_id(next_pos)
+                if building_id is not None and ct.get_entity_type(building_id) == EntityType.ROAD and ct.get_team(building_id) == ct.get_team():
+                    if ct.can_destroy(next_pos):
+                        ct.destroy(next_pos)
+                        road_replaced = True
+
+            if not road_replaced:
+                if ct.can_move(direction):
+                    ct.move(direction)
+                    return "moved"
+                return "temporary_block"
+
+            if ct.can_build_conveyor(next_pos, desired_dir):
+                ct.build_conveyor(next_pos, desired_dir)
+                if ct.can_move(direction):
+                    ct.move(direction)
+                    return "moved"
 
     if _is_permanent_blocker(ct, next_pos):
         return "permanent_block"
@@ -867,18 +1077,32 @@ def _enter_exploring(state: BuilderBotState) -> None:
     state.mode = MODE_EXPLORING
     state.target_ore = None
     state.target_adjacent_tile = None
+    state.return_goal_tile = None
     state.current_path = []
+    state.return_path = []
     state.blocked_turns = 0
 
 
 def _reset_after_harvester_build(state: BuilderBotState) -> None:
     """
-    Clears mission state after successful harvester build.
+    Transitions from ore-build phase into return-to-core conveyor phase.
     """
-    state.mode = MODE_IDLE
+    state.mode = MODE_RETURNING_TO_CORE
     state.target_ore = None
     state.target_adjacent_tile = None
     state.current_path = []
+    state.return_goal_tile = None
+    state.return_path = []
+    state.blocked_turns = 0
+
+
+def _reset_after_return_complete(state: BuilderBotState) -> None:
+    """
+    Clears mission state after finishing return-to-core routing.
+    """
+    state.mode = MODE_IDLE
+    state.return_goal_tile = None
+    state.return_path = []
     state.blocked_turns = 0
 
 
@@ -912,13 +1136,13 @@ def _is_diagonal_direction(direction: Direction) -> bool:
     return dx != 0 and dy != 0
 
 
-def _choose_diagonal_detour(ct: Controller, diagonal_direction: Direction) -> Direction | None:
+def _choose_diagonal_detour(ct: Controller, diagonal_direction: Direction, build_strategy: str = "road") -> Direction | None:
     """
     For a blocked diagonal attempt, choose one cardinal one-step detour.
 
     Preference:
     1. Immediately movable cardinal step.
-    2. Cardinal step where we can place a conveyor and then move.
+    2. Cardinal step where we can place infrastructure and then move.
     """
     dx, dy = diagonal_direction.delta()
     cardinal_candidates = []
@@ -943,12 +1167,15 @@ def _choose_diagonal_detour(ct: Controller, diagonal_direction: Direction) -> Di
         if not logic_utils.is_position_in_bounds(ct, mid):
             continue
 
-        back_direction = mid.direction_to(my_pos)
-        if _is_diagonal_direction(back_direction):
-            continue
-
-        if ct.can_build_conveyor(mid, back_direction):
-            return candidate
+        if build_strategy == "road":
+            if ct.can_build_road(mid):
+                return candidate
+        else:
+            back_direction = mid.direction_to(my_pos)
+            if _is_diagonal_direction(back_direction):
+                continue
+            if ct.can_build_conveyor(mid, back_direction):
+                return candidate
 
     return None
 
